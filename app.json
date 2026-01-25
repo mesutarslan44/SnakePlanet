@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Yılan.io",
+    "slug": "YilanIO",
+    "version": "1.1.1",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0d1a12"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yilanio.game"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0d1a12"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.yilanio.game",
+      "versionCode": 3,
+      "permissions": []
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "922fa116-4f5b-4ee0-a6cd-246a1310f549"
+      }
+    }
+  }
+}

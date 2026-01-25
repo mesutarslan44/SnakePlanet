@@ -1,0 +1,1593 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { View, Text, StyleSheet, Dimensions, TouchableOpacity, Vibration, Platform, Animated, BackHandler } from 'react-native';
+import { StatusBar } from 'expo-status-bar';
+import { LinearGradient } from 'expo-linear-gradient';
+import Joystick from '../components/Joystick';
+import { GAME_CONFIG, FOOD_TYPES, OBSTACLE_TYPES, LEVELS, DIFFICULTY, COLORS, SKINS, MAPS, AI_COLORS, ZONE_THRESHOLDS, getInfiniteLevel, CANDY_TYPES, POWERUPS } from '../constants/GameConfig';
+import { SoundEffects, preloadSounds, unloadSounds, initAudio } from '../utils/SoundManager';
+import { gameTracker } from '../utils/GameSessionTracker';
+import { shouldSpawnBoss, createBossSnake, getBossReward, updateBossAI } from '../utils/BossManager';
+
+const { width, height } = Dimensions.get('window');
+const GAME_WIDTH = width;
+const GAME_HEIGHT = height * 0.58;  // Larger play area (was 0.42, ~4x visible feel)
+const CENTER_X = GAME_WIDTH / 2;
+const CENTER_Y = GAME_HEIGHT / 2;
+const WORLD_SIZE = GAME_CONFIG.WORLD_SIZE;
+const WORLD_HALF = GAME_CONFIG.WORLD_HALF;
+
+const wrapCoord = (val) => {
+    if (val > WORLD_HALF) return val - WORLD_SIZE;
+    if (val < -WORLD_HALF) return val + WORLD_SIZE;
+    return val;
+};
+
+// Helper for smooth world wrap - returns array of positions to render
+// When object is near edge, it renders at both positions for smooth transition
+const getWrapPositions = (worldX, worldY, offsetX, offsetY, margin = 300) => {
+    const positions = [];
+    const baseX = CENTER_X + worldX + offsetX;
+    const baseY = CENTER_Y + worldY + offsetY;
+
+    // Primary position
+    positions.push({ x: baseX, y: baseY });
+
+    // Check if near world edges and add wrap positions
+    const nearLeftEdge = worldX < -WORLD_HALF + margin;
+    const nearRightEdge = worldX > WORLD_HALF - margin;
+    const nearTopEdge = worldY < -WORLD_HALF + margin;
+    const nearBottomEdge = worldY > WORLD_HALF - margin;
+
+    // Horizontal wrap
+    if (nearLeftEdge) positions.push({ x: baseX + WORLD_SIZE, y: baseY });
+    if (nearRightEdge) positions.push({ x: baseX - WORLD_SIZE, y: baseY });
+
+    // Vertical wrap
+    if (nearTopEdge) positions.push({ x: baseX, y: baseY + WORLD_SIZE });
+    if (nearBottomEdge) positions.push({ x: baseX, y: baseY - WORLD_SIZE });
+
+    // Corner wraps
+    if (nearLeftEdge && nearTopEdge) positions.push({ x: baseX + WORLD_SIZE, y: baseY + WORLD_SIZE });
+    if (nearLeftEdge && nearBottomEdge) positions.push({ x: baseX + WORLD_SIZE, y: baseY - WORLD_SIZE });
+    if (nearRightEdge && nearTopEdge) positions.push({ x: baseX - WORLD_SIZE, y: baseY + WORLD_SIZE });
+    if (nearRightEdge && nearBottomEdge) positions.push({ x: baseX - WORLD_SIZE, y: baseY - WORLD_SIZE });
+
+    return positions;
+};
+
+const GameScreen = ({ onBackToHome, updateHighScore, highScore = 0, selectedSkin = 'forest' }) => {
+    const [score, setScore] = useState(0);
+    const [gameState, setGameState] = useState('ready');
+    const [isPaused, setIsPaused] = useState(false);
+    const [currentSkinIndex, setCurrentSkinIndex] = useState(0); // Auto-changes with zone
+    const [lastEaten, setLastEaten] = useState(null);
+    const [snakeSegments, setSnakeSegments] = useState([]);
+    const [snakeAngle, setSnakeAngle] = useState(-90);
+    const [foods, setFoods] = useState([]);
+    const [candies, setCandies] = useState([]); // Candy from dead AI
+    const [powerups, setPowerups] = useState([]);
+    const [obstacles, setObstacles] = useState([]);
+    const [worldOffset, setWorldOffset] = useState({ x: 0, y: 0 });
+    const [currentLevel, setCurrentLevel] = useState(1);
+    const [showLevelUp, setShowLevelUp] = useState(false);
+    const [showTutorial, setShowTutorial] = useState(true);
+    const [currentZone, setCurrentZone] = useState(0);
+    const [showZoneChange, setShowZoneChange] = useState(false);
+    const [aiSnakes, setAiSnakes] = useState([]);
+    const [killedAI, setKilledAI] = useState(null);
+    const [unlockedAchievement, setUnlockedAchievement] = useState(null);
+
+    // Boss states
+    const [showBossWarning, setShowBossWarning] = useState(false);
+    const [showBossBattle, setShowBossBattle] = useState(false);
+    const [showBossDefeat, setShowBossDefeat] = useState(false);
+    const [bossDefeatBonus, setBossDefeatBonus] = useState(0);
+    const [currentBoss, setCurrentBoss] = useState(null);
+
+    // Event states
+    const [activeEvent, setActiveEvent] = useState(null);
+    const [eventTimeRemaining, setEventTimeRemaining] = useState(0);
+
+    // Timeout refs for cleanup (memory leak prevention)
+    const timeoutRefs = useRef([]);
+
+    const gameLoopRef = useRef(null);
+    const gameStateRef = useRef('ready');
+    const directionRef = useRef({ x: 0, y: -1 });
+    const positionHistoryRef = useRef([]);
+    const foodsRef = useRef([]);
+    const candiesRef = useRef([]);
+    const powerupsRef = useRef([]);
+    const obstaclesRef = useRef([]);
+    const lastPowerupSpawnRef = useRef(0);
+    const activePowerupsRef = useRef({}); // { speed: expiryTs, double: expiryTs }
+    const aiSnakesRef = useRef([]);
+    const scoreRef = useRef(0);
+    const worldOffsetRef = useRef({ x: 0, y: 0 });
+    const playerWorldPosRef = useRef({ x: 0, y: 0 });
+    const isMovingRef = useRef(false);
+    const snakeLengthRef = useRef(GAME_CONFIG.SNAKE_INITIAL_LENGTH);
+    const currentLevelRef = useRef(1);
+    const currentBossRef = useRef(null);
+    const comboCountRef = useRef(0);
+    const lastEatTimeRef = useRef(0);
+
+    const [showCombo, setShowCombo] = useState(null);
+    const [activePowerupExpires, setActivePowerupExpires] = useState({});
+    const [powerupTick, setPowerupTick] = useState(0);
+    const comboAnim = useRef(new Animated.Value(0)).current;
+    const eatenPopupAnim = useRef(new Animated.Value(1)).current;
+
+    const levelUpAnim = useRef(new Animated.Value(0)).current;
+    const zoneChangeAnim = useRef(new Animated.Value(0)).current;
+    const bossWarningAnim = useRef(new Animated.Value(0)).current;
+    const bossDefeatAnim = useRef(new Animated.Value(0)).current;
+
+    const currentMapData = MAPS[Math.min(currentZone, MAPS.length - 1)];
+    const currentSkinData = SKINS[Math.min(currentSkinIndex, SKINS.length - 1)];
+
+    const getLevelData = (level) => level <= LEVELS.length ? LEVELS[level - 1] : getInfiniteLevel(level);
+    const currentLevelData = getLevelData(currentLevel);
+    const progressToNextLevel = currentLevelData ? Math.min(100, (score / currentLevelData.targetScore) * 100) : 100;
+
+    // Hexagonal Grid Pattern - Petek (Slither.io style) arka plan
+    const HexagonGrid = useMemo(() => {
+        const hexSize = 40;
+        const hexHeight = hexSize * Math.sqrt(3);
+        const hexWidth = hexSize * 2;
+        const cols = Math.ceil(GAME_WIDTH / (hexWidth * 0.75)) + 2;
+        const rows = Math.ceil(GAME_HEIGHT / hexHeight) + 2;
+        const gridColor = 'rgba(255, 255, 255, 0.08)';
+
+        const hexagons = [];
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const x = col * hexWidth * 0.75;
+                const y = row * hexHeight + (col % 2 === 1 ? hexHeight / 2 : 0);
+                hexagons.push(
+                    <View
+                        key={`hex_${row}_${col}`}
+                        style={{
+                            position: 'absolute',
+                            left: x - hexSize,
+                            top: y - hexHeight / 2,
+                            width: hexSize * 2,
+                            height: hexHeight,
+                            borderWidth: 1,
+                            borderColor: gridColor,
+                            backgroundColor: 'transparent',
+                            transform: [{ rotate: '30deg' }],
+                            borderRadius: hexSize / 3,
+                        }}
+                    />
+                );
+            }
+        }
+        return (
+            <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, overflow: 'hidden', opacity: 0.6 }}>
+                {hexagons}
+            </View>
+        );
+    }, [currentMapData?.id]);
+
+    const decorations = useMemo(() => {
+        const items = [];
+        const decoTypes = currentMapData?.decorations || ['🌿'];
+        const opacity = currentMapData?.decorationOpacity ?? 0.28;
+        for (let i = 0; i < 16; i++) {
+            items.push({ id: i, emoji: decoTypes[i % decoTypes.length], x: (Math.random() - 0.5) * WORLD_SIZE * 0.88, y: (Math.random() - 0.5) * WORLD_SIZE * 0.88, size: 12 + Math.random() * 10, opacity: opacity * (0.7 + Math.random() * 0.3) });
+        }
+        return items;
+    }, [currentMapData?.id]);
+
+    const stopGameLoop = () => { if (gameLoopRef.current) { cancelAnimationFrame(gameLoopRef.current); gameLoopRef.current = null; } };
+
+    // Helper to track timeouts for cleanup
+    const addTimeout = (callback, delay) => {
+        const id = setTimeout(callback, delay);
+        timeoutRefs.current.push(id);
+        return id;
+    };
+
+    const clearAllTimeouts = () => {
+        timeoutRefs.current.forEach(id => clearTimeout(id));
+        timeoutRefs.current = [];
+    };
+
+    // Pause/Resume functions
+    const togglePause = () => {
+        if (gameState !== 'playing') return;
+        if (isPaused) {
+            setIsPaused(false);
+            startGameLoop();
+        } else {
+            setIsPaused(true);
+            stopGameLoop();
+        }
+    };
+
+    useEffect(() => {
+        initAudio();
+        preloadSounds();
+        initGame();
+        return () => {
+            stopGameLoop();
+            clearAllTimeouts();
+            unloadSounds();
+        };
+    }, []);
+
+    useEffect(() => {
+        const id = setInterval(() => {
+            const now = Date.now();
+            setActivePowerupExpires(prev => {
+                const next = { ...prev };
+                let changed = false;
+                if (prev.speed && now > prev.speed) { delete next.speed; changed = true; }
+                if (prev.double && now > prev.double) { delete next.double; changed = true; }
+                return changed ? next : prev;
+            });
+            setPowerupTick(now);
+        }, 1000);
+        return () => clearInterval(id);
+    }, []);
+
+    // Handle Android back button - pause instead of exit
+    useEffect(() => {
+        const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
+            if (gameStateRef.current === 'playing') {
+                if (isPaused) {
+                    // Already paused - exit to home
+                    onBackToHome();
+                } else {
+                    // Playing - pause the game
+                    setIsPaused(true);
+                    stopGameLoop();
+                }
+                return true; // Prevent default back behavior
+            }
+            return false; // Let default behavior handle other states
+        });
+
+        return () => backHandler.remove();
+    }, [isPaused]);
+    useEffect(() => { if (currentLevelData && score >= currentLevelData.targetScore && gameState === 'playing') levelUp(); }, [score]);
+    useEffect(() => {
+        const newZone = ZONE_THRESHOLDS.findIndex((t, i) => score >= t && score < (ZONE_THRESHOLDS[i + 1] || Infinity));
+        if (newZone !== currentZone && newZone >= 0 && gameState === 'playing') changeZone(newZone);
+    }, [score]);
+
+    const changeZone = (newZone) => {
+        setCurrentZone(newZone);
+        setCurrentSkinIndex(newZone); // Auto skin change!
+        setShowZoneChange(true);
+        if (Platform.OS !== 'web') Vibration.vibrate([0, 30, 20, 30]);
+        zoneChangeAnim.setValue(0);
+        Animated.sequence([
+            Animated.timing(zoneChangeAnim, { toValue: 1, duration: 250, useNativeDriver: true }),
+            Animated.delay(900),
+            Animated.timing(zoneChangeAnim, { toValue: 0, duration: 250, useNativeDriver: true }),
+        ]).start(() => setShowZoneChange(false));
+    };
+
+    const levelUp = () => {
+        const newLevel = currentLevel + 1;
+        currentLevelRef.current = newLevel;
+        setCurrentLevel(newLevel);
+        setShowLevelUp(true);
+        if (Platform.OS !== 'web') Vibration.vibrate([0, 40, 25, 40]);
+        SoundEffects.levelup();
+        levelUpAnim.setValue(0);
+        Animated.sequence([
+            Animated.timing(levelUpAnim, { toValue: 1, duration: 200, useNativeDriver: true }),
+            Animated.delay(600),
+            Animated.timing(levelUpAnim, { toValue: 0, duration: 200, useNativeDriver: true }),
+        ]).start(() => setShowLevelUp(false));
+
+        const levelData = getLevelData(newLevel);
+        while (obstaclesRef.current.length < levelData.obstacles) {
+            obstaclesRef.current.push(createObstacle(Date.now() + obstaclesRef.current.length));
+        }
+        setObstacles([...obstaclesRef.current]);
+
+        // ===  BOSS SPAWN LOGIC  ===
+        if (shouldSpawnBoss(newLevel)) {
+            // Show boss warning - brief top banner (NOT blocking gameplay!)
+            setShowBossWarning(true);
+            if (Platform.OS !== 'web') Vibration.vibrate([0, 50, 30, 50]);
+            SoundEffects.levelup(); // Alert sound
+
+            bossWarningAnim.setValue(0);
+            Animated.sequence([
+                Animated.timing(bossWarningAnim, { toValue: 1, duration: 200, useNativeDriver: true }),
+                Animated.delay(1500),
+                Animated.timing(bossWarningAnim, { toValue: 0, duration: 200, useNativeDriver: true }),
+            ]).start(() => setShowBossWarning(false));
+
+            // Spawn boss after warning
+            addTimeout(() => {
+                const boss = createBossSnake(newLevel);
+                aiSnakesRef.current.push(boss);
+                currentBossRef.current = boss;
+                setCurrentBoss(boss);
+                setAiSnakes([...aiSnakesRef.current]);
+                setShowBossBattle(true);
+
+                // Boss battle indicator fades out after 5 seconds
+                addTimeout(() => setShowBossBattle(false), 5000);
+            }, 2000);
+        }
+    };
+
+
+    const createAISnake = (index) => {
+        const colorData = AI_COLORS[index % AI_COLORS.length];
+        const angle = Math.random() * Math.PI * 2;
+        const distance = 200 + Math.random() * 350;
+        const startX = Math.cos(angle) * distance;
+        const startY = Math.sin(angle) * distance;
+        const dir = Math.random() * Math.PI * 2;
+
+        // Create position history like player snake (for proper segment spacing)
+        const segmentGap = GAME_CONFIG.SEGMENT_GAP; // Same gap as player
+        const positionHistory = [];
+        for (let i = 0; i < 300; i++) {
+            positionHistory.push({
+                x: startX - Math.cos(dir) * i * 2,
+                y: startY - Math.sin(dir) * i * 2
+            });
+        }
+
+        // Create segments from history (same logic as player)
+        const segments = [];
+        for (let i = 0; i < GAME_CONFIG.AI_SNAKE_INITIAL_LENGTH; i++) {
+            const histIdx = i * Math.max(2, segmentGap);
+            if (histIdx < positionHistory.length) {
+                segments.push({ ...positionHistory[histIdx] });
+            }
+        }
+
+        return {
+            id: `ai_${index}_${Date.now()}`,
+            ...colorData,
+            worldX: startX,
+            worldY: startY,
+            direction: { x: Math.cos(dir), y: Math.sin(dir) },
+            segments,
+            positionHistory, // Store history for segment spacing
+            length: GAME_CONFIG.AI_SNAKE_INITIAL_LENGTH,
+            alive: true,
+            score: 0
+        };
+    };
+
+    // Spawn candy trail when AI dies
+    const spawnCandyTrail = (ai) => {
+        const newCandies = [];
+        const numCandies = Math.min(ai.length * 2, 30);
+        const timestamp = Date.now();
+        for (let i = 0; i < numCandies; i++) {
+            const seg = ai.segments[Math.floor(i / 2) % ai.segments.length] || ai.segments[0];
+            const candyType = CANDY_TYPES[Math.floor(Math.random() * CANDY_TYPES.length)];
+            newCandies.push({
+                id: `candy_${timestamp}_${i}_${Math.random().toString(36).substr(2, 9)}`,
+                worldX: seg.x + (Math.random() - 0.5) * 40,
+                worldY: seg.y + (Math.random() - 0.5) * 40,
+                ...candyType,
+            });
+        }
+        candiesRef.current = [...candiesRef.current, ...newCandies];
+        setCandies([...candiesRef.current]);
+    };
+
+    const initGame = () => {
+        stopGameLoop();
+        gameStateRef.current = 'ready';
+
+        const history = [];
+        for (let i = 0; i < 500; i++) history.push({ x: CENTER_X, y: CENTER_Y + i * 2 });
+        positionHistoryRef.current = history;
+        updateSnakeFromHistory();
+
+        const initialFoods = [];
+        for (let i = 0; i < DIFFICULTY.INITIAL_FOOD_COUNT; i++) initialFoods.push(createFood(i));
+        foodsRef.current = initialFoods;
+        setFoods(initialFoods);
+
+        candiesRef.current = [];
+        setCandies([]);
+        powerupsRef.current = [];
+        setPowerups([]);
+        lastPowerupSpawnRef.current = 0;
+        activePowerupsRef.current = {};
+        setActivePowerupExpires({});
+
+        const levelData = getLevelData(1);
+        const initialObstacles = [];
+        for (let i = 0; i < levelData.obstacles; i++) initialObstacles.push(createObstacle(i));
+        obstaclesRef.current = initialObstacles;
+        setObstacles(initialObstacles);
+
+        const ais = [];
+        for (let i = 0; i < GAME_CONFIG.AI_SNAKE_COUNT; i++) ais.push(createAISnake(i));
+        aiSnakesRef.current = ais;
+        setAiSnakes(ais);
+
+        scoreRef.current = 0;
+        setScore(0);
+        currentLevelRef.current = 1;
+        setCurrentLevel(1);
+        setCurrentZone(0);
+        worldOffsetRef.current = { x: 0, y: 0 };
+        playerWorldPosRef.current = { x: 0, y: 0 };
+        setWorldOffset({ x: 0, y: 0 });
+        directionRef.current = { x: 0, y: -1 };
+        setSnakeAngle(-90);
+        isMovingRef.current = false;
+        snakeLengthRef.current = GAME_CONFIG.SNAKE_INITIAL_LENGTH;
+        setGameState('ready');
+        setLastEaten(null);
+        setKilledAI(null);
+        setShowLevelUp(false);
+        setShowZoneChange(false);
+        setShowTutorial(true);
+        comboCountRef.current = 0;
+        lastEatTimeRef.current = 0;
+        setShowCombo(null);
+    };
+
+    const startPlaying = () => {
+        stopGameLoop();
+        setShowTutorial(false);
+        setGameState('playing');
+        gameStateRef.current = 'playing';
+
+        // Start session tracking
+        gameTracker.startSession();
+
+        startGameLoop();
+    };
+
+    const updateSnakeFromHistory = () => {
+        const history = positionHistoryRef.current;
+        const segments = [{ x: CENTER_X, y: CENTER_Y }];
+        for (let i = 1; i < snakeLengthRef.current; i++) {
+            const idx = i * Math.max(2, GAME_CONFIG.SEGMENT_GAP);
+            if (idx < history.length) segments.push({ ...history[idx] });
+        }
+        setSnakeSegments(segments);
+    };
+
+    const createFood = (index) => {
+        const type = FOOD_TYPES[Math.floor(Math.random() * FOOD_TYPES.length)];
+        const uid = Math.random().toString(36).substr(2, 9);
+        return { ...type, id: `food_${Date.now()}_${index}_${uid}`, worldX: (Math.random() - 0.5) * WORLD_SIZE * 0.9, worldY: (Math.random() - 0.5) * WORLD_SIZE * 0.9 };
+    };
+
+    const SPEED_DOUBLE_POWERUPS = POWERUPS.filter(p => p.id === 'speed' || p.id === 'double');
+    const createPowerup = () => {
+        const type = SPEED_DOUBLE_POWERUPS[Math.floor(Math.random() * SPEED_DOUBLE_POWERUPS.length)];
+        const uid = Math.random().toString(36).substr(2, 9);
+        return { ...type, id: `powerup_${Date.now()}_${uid}`, worldX: (Math.random() - 0.5) * WORLD_SIZE * 0.9, worldY: (Math.random() - 0.5) * WORLD_SIZE * 0.9 };
+    };
+
+    const createObstacle = (index) => {
+        const type = OBSTACLE_TYPES[Math.floor(Math.random() * OBSTACLE_TYPES.length)];
+        const uid = Math.random().toString(36).substr(2, 9);
+        return { ...type, id: `obstacle_${Date.now()}_${index}_${uid}`, worldX: (Math.random() - 0.5) * WORLD_SIZE * 0.9, worldY: (Math.random() - 0.5) * WORLD_SIZE * 0.9 };
+    };
+
+    const startGameLoop = () => {
+        let lastTime = Date.now();
+        let frameCount = 0;
+        const loop = () => {
+            if (gameStateRef.current === 'gameover') return;
+            const now = Date.now();
+            if (now - lastTime >= 14) { // ~71 fps for smoother, more fluid feel (was 16ms)
+                lastTime = now;
+                frameCount++;
+                updateGame(frameCount);
+            }
+            gameLoopRef.current = requestAnimationFrame(loop);
+        };
+        gameLoopRef.current = requestAnimationFrame(loop);
+    };
+
+    const updateGame = (frameCount) => {
+        if (!isMovingRef.current) return;
+
+        const now = Date.now();
+        const ap = activePowerupsRef.current;
+        if (ap.speed && now > ap.speed) delete ap.speed;
+        if (ap.double && now > ap.double) delete ap.double;
+
+        const speedMult = ap.speed && now < ap.speed ? 1.8 : 1;
+        const speed = GAME_CONFIG.SNAKE_SPEED * speedMult;
+        const dir = directionRef.current;
+
+        if (frameCount - lastPowerupSpawnRef.current > 45 * 60 && powerupsRef.current.length < 2) {
+            lastPowerupSpawnRef.current = frameCount;
+            const pu = createPowerup();
+            powerupsRef.current.push(pu);
+            setPowerups([...powerupsRef.current]);
+        }
+
+        playerWorldPosRef.current.x = wrapCoord(playerWorldPosRef.current.x + dir.x * speed);
+        playerWorldPosRef.current.y = wrapCoord(playerWorldPosRef.current.y + dir.y * speed);
+        worldOffsetRef.current = { x: -playerWorldPosRef.current.x, y: -playerWorldPosRef.current.y };
+
+        const history = positionHistoryRef.current;
+        for (let i = 0; i < history.length; i++) { history[i].x -= dir.x * speed; history[i].y -= dir.y * speed; }
+        history.unshift({ x: CENTER_X, y: CENTER_Y });
+        while (history.length > 600) history.pop();
+
+        const segments = [{ x: CENTER_X, y: CENTER_Y }];
+        const maxSegs = Math.min(snakeLengthRef.current, 80); // Performance limit
+        for (let i = 1; i < maxSegs; i++) {
+            const idx = i * Math.max(2, GAME_CONFIG.SEGMENT_GAP);
+            if (idx < history.length) segments.push({ ...history[idx] });
+        }
+
+        setSnakeAngle(Math.atan2(dir.y, dir.x) * (180 / Math.PI));
+        setWorldOffset({ ...worldOffsetRef.current });
+        setSnakeSegments(segments);
+
+        // AI every frame for smoother, more fluid feel (was every 2 frames)
+        updateAISnakes();
+
+        checkCollisions();
+    };
+
+
+    const updateAISnakes = () => {
+        const ais = aiSnakesRef.current;
+        const foods = foodsRef.current;
+        const obstacles = obstaclesRef.current;
+        const playerX = playerWorldPosRef.current.x;
+        const playerY = playerWorldPosRef.current.y;
+        const playerLen = snakeLengthRef.current;
+
+        ais.forEach(ai => {
+            if (!ai.alive) return;
+
+            // === BOSS AI SPECIAL BEHAVIOR ===
+            if (ai.isBoss) {
+                updateBossAI(ai, playerX, playerY, playerLen, obstacles);
+
+                // Move boss (faster than normal AI)
+                const speed = GAME_CONFIG.AI_SNAKE_SPEED * (ai.speedMultiplier || 1.2);
+                ai.worldX = wrapCoord(ai.worldX + ai.direction.x * speed);
+                ai.worldY = wrapCoord(ai.worldY + ai.direction.y * speed);
+
+                // Update position history (same as normal AI - for proper segment spacing)
+                if (!ai.positionHistory) ai.positionHistory = [];
+                ai.positionHistory.unshift({ x: ai.worldX, y: ai.worldY });
+                while (ai.positionHistory.length > 500) ai.positionHistory.pop();
+
+                // Rebuild segments from history with proper spacing (same as normal AI)
+                const segmentGap = GAME_CONFIG.SEGMENT_GAP;
+                const newSegments = [{ x: ai.worldX, y: ai.worldY }]; // Head
+                for (let i = 1; i < ai.length; i++) {
+                    const histIdx = i * Math.max(2, segmentGap);
+                    if (histIdx < ai.positionHistory.length) {
+                        newSegments.push({ ...ai.positionHistory[histIdx] });
+                    }
+                }
+                ai.segments = newSegments;
+
+                // === BOSS SELF-COLLISION CHECK ===
+                // Boss can also crash into its own tail (even with avoidance, sometimes it happens)
+                if (ai.segments.length >= 4) {
+                    const bossHead = ai.segments[0];
+                    const minCheckIndex = Math.max(3, Math.floor(ai.segments.length * 0.2));
+                    for (let i = minCheckIndex; i < ai.segments.length; i++) {
+                        const seg = ai.segments[i];
+                        if (!seg) continue;
+                        const dist = Math.sqrt((bossHead.x - seg.x) ** 2 + (bossHead.y - seg.y) ** 2);
+                        if (dist < GAME_CONFIG.SELF_COLLISION_RADIUS + 10) {
+                            killAI(ai);
+                            return;
+                        }
+                    }
+                }
+
+                // Boss doesn't eat food - just hunts player!
+                return;
+            }
+
+            // === OBSTACLE AVOIDANCE (HIGH PRIORITY) ===
+            let avoidDir = { x: 0, y: 0 };
+            let mustAvoid = false;
+            const AVOID_RADIUS = 70;
+
+            for (const obs of obstacles) {
+                const dx = ai.worldX - obs.worldX;
+                const dy = ai.worldY - obs.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < AVOID_RADIUS) {
+                    const force = (AVOID_RADIUS - dist) / AVOID_RADIUS;
+                    avoidDir.x += (dx / dist) * force;
+                    avoidDir.y += (dy / dist) * force;
+                    mustAvoid = true;
+                }
+            }
+
+            // === PLAYER BODY AVOIDANCE (CRITICAL - prevents direct crashes!) ===
+            const PLAYER_AVOID_RADIUS = 50;
+            const playerHistory = positionHistoryRef.current;
+            const playerHead = playerWorldPosRef.current;
+
+            // Check player's body segments
+            for (let i = 0; i < Math.min(playerHistory.length, snakeLengthRef.current * 4); i += 4) {
+                const histPos = playerHistory[i];
+                if (!histPos) continue;
+
+                const segWorldX = playerHead.x + (histPos.x - CENTER_X);
+                const segWorldY = playerHead.y + (histPos.y - CENTER_Y);
+                const dx = ai.worldX - segWorldX;
+                const dy = ai.worldY - segWorldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist < PLAYER_AVOID_RADIUS && dist > 5) {
+                    const force = (PLAYER_AVOID_RADIUS - dist) / PLAYER_AVOID_RADIUS * 1.5;
+                    avoidDir.x += (dx / dist) * force;
+                    avoidDir.y += (dy / dist) * force;
+                    mustAvoid = true;
+                }
+            }
+
+            // === OTHER AI AVOIDANCE ===
+            const AI_AVOID_RADIUS = 40;
+            for (const otherAi of ais) {
+                if (otherAi.id === ai.id || !otherAi.alive) continue;
+
+                // Avoid other AI heads
+                const dx = ai.worldX - otherAi.worldX;
+                const dy = ai.worldY - otherAi.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist < AI_AVOID_RADIUS && dist > 5) {
+                    const force = (AI_AVOID_RADIUS - dist) / AI_AVOID_RADIUS;
+                    avoidDir.x += (dx / dist) * force;
+                    avoidDir.y += (dy / dist) * force;
+                    mustAvoid = true;
+                }
+            }
+
+            // Also avoid world edges
+            const EDGE_AVOID = 120;
+            const halfWorld = WORLD_SIZE / 2;
+            if (ai.worldX < -halfWorld + EDGE_AVOID) { avoidDir.x += 1.5; mustAvoid = true; }
+            if (ai.worldX > halfWorld - EDGE_AVOID) { avoidDir.x -= 1.5; mustAvoid = true; }
+            if (ai.worldY < -halfWorld + EDGE_AVOID) { avoidDir.y += 1.5; mustAvoid = true; }
+            if (ai.worldY > halfWorld - EDGE_AVOID) { avoidDir.y -= 1.5; mustAvoid = true; }
+
+            // === SMART TARGETING ===
+            let nearestFood = null;
+            let nearestDist = GAME_CONFIG.AI_HUNT_RADIUS;
+
+            // Search foods
+            for (const food of foods) {
+                const dx = food.worldX - ai.worldX;
+                const dy = food.worldY - ai.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < nearestDist) { nearestDist = dist; nearestFood = food; }
+            }
+
+            // Search candies (higher priority - more points)
+            for (const candy of candiesRef.current) {
+                const dx = candy.worldX - ai.worldX;
+                const dy = candy.worldY - ai.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                // Candy has higher priority, so check with 1.5x radius
+                if (dist < nearestDist * 1.5) { nearestDist = dist; nearestFood = candy; }
+            }
+
+            // === PLAYER INTERACTION ===
+            const distToPlayer = Math.sqrt((playerX - ai.worldX) ** 2 + (playerY - ai.worldY) ** 2);
+            const shouldFlee = distToPlayer < GAME_CONFIG.AI_FLEE_RADIUS && playerLen > ai.length + 3;
+
+            // ENCIRCLE: When AI is much longer and close enough, try to trap player!
+            const shouldEncircle = ai.length > playerLen + 8 && distToPlayer < 200 && distToPlayer > 40;
+            const shouldHunt = distToPlayer < 150 && ai.length > playerLen + 2 && !shouldEncircle && Math.random() < 0.4;
+
+            // === DIRECTION DECISION ===
+            let targetDir = { x: ai.direction.x, y: ai.direction.y };
+
+            if (mustAvoid) {
+                // PRIORITY 1: Avoid obstacles
+                const mag = Math.sqrt(avoidDir.x ** 2 + avoidDir.y ** 2);
+                if (mag > 0) {
+                    targetDir.x = avoidDir.x / mag;
+                    targetDir.y = avoidDir.y / mag;
+                }
+                // Fast turn when avoiding
+                ai.direction.x = ai.direction.x * 0.5 + targetDir.x * 0.5;
+                ai.direction.y = ai.direction.y * 0.5 + targetDir.y * 0.5;
+            } else if (shouldFlee) {
+                // PRIORITY 2: Run away from player
+                const dx = ai.worldX - playerX;
+                const dy = ai.worldY - playerY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                targetDir = { x: dx / dist, y: dy / dist };
+                ai.direction.x = ai.direction.x * 0.7 + targetDir.x * 0.3;
+                ai.direction.y = ai.direction.y * 0.7 + targetDir.y * 0.3;
+            } else if (shouldEncircle) {
+                // PRIORITY 3: ENCIRCLE - Orbit around player to trap them!
+                // BUT must maintain minimum distance and keep moving realistically
+                const dx = playerX - ai.worldX;
+                const dy = playerY - ai.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+
+                // Minimum orbit radius - can't get closer than this
+                const MIN_ORBIT_RADIUS = 80;
+                const IDEAL_ORBIT_RADIUS = 120;
+
+                // Track encircle time - don't orbit forever
+                ai.encircleTime = (ai.encircleTime || 0) + 1;
+                const maxEncircleTime = 180; // ~3 seconds at 60fps
+
+                // If orbiting too long, break off and hunt food
+                if (ai.encircleTime > maxEncircleTime) {
+                    ai.encircleTime = 0;
+                    ai.orbitDirection = null; // Reset for next time
+                    // Fall through to food hunting
+                } else {
+                    // Calculate perpendicular direction for orbiting
+                    const orbitDir = ai.orbitDirection || (Math.random() < 0.5 ? 1 : -1);
+                    ai.orbitDirection = orbitDir;
+
+                    const perpX = -dy / dist * orbitDir;
+                    const perpY = dx / dist * orbitDir;
+
+                    // Adjust based on distance - push outward if too close!
+                    let radialAdjust = 0;
+                    if (dist < MIN_ORBIT_RADIUS) {
+                        // Too close! Push outward strongly
+                        radialAdjust = -0.6; // Negative = away from player
+                    } else if (dist < IDEAL_ORBIT_RADIUS) {
+                        // Slightly too close, gentle push
+                        radialAdjust = -0.2;
+                    } else if (dist > IDEAL_ORBIT_RADIUS + 30) {
+                        // Too far, pull closer
+                        radialAdjust = 0.15;
+                    }
+
+                    targetDir.x = perpX + (dx / dist) * radialAdjust;
+                    targetDir.y = perpY + (dy / dist) * radialAdjust;
+
+                    // Normalize
+                    const mag = Math.sqrt(targetDir.x ** 2 + targetDir.y ** 2);
+                    if (mag > 0) {
+                        targetDir.x /= mag;
+                        targetDir.y /= mag;
+                    }
+
+                    // Smooth turning for realistic movement
+                    ai.direction.x = ai.direction.x * 0.8 + targetDir.x * 0.2;
+                    ai.direction.y = ai.direction.y * 0.8 + targetDir.y * 0.2;
+                }
+            } else if (shouldHunt) {
+                // PRIORITY 4: Direct hunt player
+                const dx = playerX - ai.worldX;
+                const dy = playerY - ai.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                targetDir = { x: dx / dist, y: dy / dist };
+                ai.direction.x = ai.direction.x * 0.85 + targetDir.x * 0.15;
+                ai.direction.y = ai.direction.y * 0.85 + targetDir.y * 0.15;
+            } else if (nearestFood) {
+                // PRIORITY 5: Hunt food
+                const dx = nearestFood.worldX - ai.worldX;
+                const dy = nearestFood.worldY - ai.worldY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                targetDir = { x: dx / dist, y: dy / dist };
+                ai.direction.x = ai.direction.x * 0.88 + targetDir.x * 0.12;
+                ai.direction.y = ai.direction.y * 0.88 + targetDir.y * 0.12;
+            } else if (Math.random() < GAME_CONFIG.AI_TURN_CHANCE) {
+                // Random exploration
+                const turnAngle = (Math.random() - 0.5) * 0.5;
+                const currentAngle = Math.atan2(ai.direction.y, ai.direction.x);
+                ai.direction = { x: Math.cos(currentAngle + turnAngle), y: Math.sin(currentAngle + turnAngle) };
+            }
+
+            // Normalize direction
+            const mag = Math.sqrt(ai.direction.x ** 2 + ai.direction.y ** 2);
+            if (mag > 0) { ai.direction.x /= mag; ai.direction.y /= mag; }
+
+            // Move AI and update position history (same system as player)
+            const speed = GAME_CONFIG.AI_SNAKE_SPEED * (mustAvoid ? 1.2 : 1);
+            ai.worldX = wrapCoord(ai.worldX + ai.direction.x * speed);
+            ai.worldY = wrapCoord(ai.worldY + ai.direction.y * speed);
+
+            // Update position history (like player's positionHistoryRef)
+            ai.positionHistory.unshift({ x: ai.worldX, y: ai.worldY });
+            while (ai.positionHistory.length > 400) ai.positionHistory.pop();
+
+            // Rebuild segments from history with proper spacing (same as updateSnakeFromHistory)
+            const segmentGap = GAME_CONFIG.SEGMENT_GAP;
+            const newSegments = [{ x: ai.worldX, y: ai.worldY }]; // Head
+            for (let i = 1; i < ai.length; i++) {
+                const histIdx = i * Math.max(2, segmentGap);
+                if (histIdx < ai.positionHistory.length) {
+                    newSegments.push({ ...ai.positionHistory[histIdx] });
+                }
+            }
+            ai.segments = newSegments;
+
+            // === AI SELF-COLLISION: AI dies if it hits its own tail ===
+            // IMPROVED: Check for ALL AI snakes, even small ones - more aggressive detection
+            if (ai.segments.length >= 4) { // Even tiny snakes can crash
+                const aiHead = ai.segments[0];
+                // Skip first 2 segments (head + neck), check from segment 3 onwards
+                const minCheckIndex = Math.max(2, Math.floor(ai.segments.length * 0.15)); // At least 15% of body
+                for (let i = minCheckIndex; i < ai.segments.length; i++) {
+                    const seg = ai.segments[i];
+                    if (!seg) continue;
+                    const dist = Math.sqrt((aiHead.x - seg.x) ** 2 + (aiHead.y - seg.y) ** 2);
+                    // Larger collision radius for better detection (was +4, now +8)
+                    // Also check more segments for long snakes
+                    const collisionRadius = GAME_CONFIG.SELF_COLLISION_RADIUS + 8;
+                    if (dist < collisionRadius) {
+                        // AI crashed into its own tail - it dies!
+                        killAI(ai);
+                        break;
+                    }
+                }
+            }
+
+            if (!ai.alive) return; // Skip rest if AI died from self-collision
+
+            // AI eats food
+            for (let i = foods.length - 1; i >= 0; i--) {
+                const food = foods[i];
+                const dist = Math.sqrt((food.worldX - ai.worldX) ** 2 + (food.worldY - ai.worldY) ** 2);
+                if (dist < GAME_CONFIG.FOOD_COLLISION_RADIUS) {
+                    foods.splice(i, 1);
+                    ai.length++;
+                    ai.score += food.points;
+                    if (foods.length < DIFFICULTY.MAX_FOOD) foods.push(createFood(Date.now()));
+                    break;
+                }
+            }
+
+            // AI eats candy
+            for (let i = candiesRef.current.length - 1; i >= 0; i--) {
+                const candy = candiesRef.current[i];
+                const dist = Math.sqrt((candy.worldX - ai.worldX) ** 2 + (candy.worldY - ai.worldY) ** 2);
+                if (dist < GAME_CONFIG.FOOD_COLLISION_RADIUS) {
+                    candiesRef.current.splice(i, 1);
+                    ai.length++;
+                    ai.score += candy.points;
+                    break;
+                }
+            }
+        });
+
+        foodsRef.current = [...foods];
+        setFoods([...foods]);
+        setCandies([...candiesRef.current]);
+        setAiSnakes([...ais]);
+    };
+
+    const checkCollisions = () => {
+        const headX = playerWorldPosRef.current.x;
+        const headY = playerWorldPosRef.current.y;
+
+        // Food
+        for (let i = foodsRef.current.length - 1; i >= 0; i--) {
+            const food = foodsRef.current[i];
+            if (Math.sqrt((food.worldX - headX) ** 2 + (food.worldY - headY) ** 2) < GAME_CONFIG.FOOD_COLLISION_RADIUS) {
+                foodsRef.current.splice(i, 1);
+                const mult = (activePowerupsRef.current.double && Date.now() < activePowerupsRef.current.double) ? 2 : 1;
+                const pts = food.points * mult;
+                const now = Date.now();
+                if (now - lastEatTimeRef.current < 1200) comboCountRef.current++;
+                else comboCountRef.current = 1;
+                lastEatTimeRef.current = now;
+                const combo = comboCountRef.current;
+                const comboBonus = combo >= 2 ? combo : 0;
+                const totalPts = pts + comboBonus;
+                if (combo >= 2) {
+                    setShowCombo(combo);
+                    comboAnim.setValue(0);
+                    Animated.timing(comboAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+                    addTimeout(() => setShowCombo(null), 650);
+                }
+                scoreRef.current += totalPts;
+                setScore(scoreRef.current);
+                snakeLengthRef.current++;
+
+                gameTracker.updateScore(scoreRef.current);
+                gameTracker.updateSnakeLength(snakeLengthRef.current);
+
+                setLastEaten({ emoji: food.emoji, points: totalPts });
+                eatenPopupAnim.setValue(0);
+                Animated.timing(eatenPopupAnim, { toValue: 1, duration: 220, useNativeDriver: true }).start();
+                addTimeout(() => setLastEaten(null), 350);
+                if (Platform.OS !== 'web') Vibration.vibrate(12);
+                SoundEffects.eat();
+                if (foodsRef.current.length < DIFFICULTY.MAX_FOOD) foodsRef.current.push(createFood(Date.now()));
+                setFoods([...foodsRef.current]);
+                break;
+            }
+        }
+
+        // Candy
+        for (let i = candiesRef.current.length - 1; i >= 0; i--) {
+            const candy = candiesRef.current[i];
+            if (Math.sqrt((candy.worldX - headX) ** 2 + (candy.worldY - headY) ** 2) < GAME_CONFIG.FOOD_COLLISION_RADIUS) {
+                candiesRef.current.splice(i, 1);
+                const mult = (activePowerupsRef.current.double && Date.now() < activePowerupsRef.current.double) ? 2 : 1;
+                const pts = candy.points * mult;
+                const now = Date.now();
+                if (now - lastEatTimeRef.current < 1200) comboCountRef.current++;
+                else comboCountRef.current = 1;
+                lastEatTimeRef.current = now;
+                const combo = comboCountRef.current;
+                const comboBonus = combo >= 2 ? combo : 0;
+                const totalPts = pts + comboBonus;
+                if (combo >= 2) {
+                    setShowCombo(combo);
+                    comboAnim.setValue(0);
+                    Animated.timing(comboAnim, { toValue: 1, duration: 180, useNativeDriver: true }).start();
+                    addTimeout(() => setShowCombo(null), 650);
+                }
+                scoreRef.current += totalPts;
+                setScore(scoreRef.current);
+                snakeLengthRef.current++;
+                setLastEaten({ emoji: candy.emoji, points: totalPts });
+                eatenPopupAnim.setValue(0);
+                Animated.timing(eatenPopupAnim, { toValue: 1, duration: 220, useNativeDriver: true }).start();
+                addTimeout(() => setLastEaten(null), 300);
+                if (Platform.OS !== 'web') Vibration.vibrate(10);
+                SoundEffects.eat();
+                setCandies([...candiesRef.current]);
+                break;
+            }
+        }
+
+        // Power-ups
+        for (let i = powerupsRef.current.length - 1; i >= 0; i--) {
+            const pu = powerupsRef.current[i];
+            if (Math.sqrt((pu.worldX - headX) ** 2 + (pu.worldY - headY) ** 2) < GAME_CONFIG.FOOD_COLLISION_RADIUS + 4) {
+                powerupsRef.current.splice(i, 1);
+                setPowerups([...powerupsRef.current]);
+                const dur = pu.id === 'speed' ? 8000 : 10000;
+                const endTs = Date.now() + dur;
+                activePowerupsRef.current[pu.id] = endTs;
+                setActivePowerupExpires(prev => ({ ...prev, [pu.id]: endTs }));
+                if (Platform.OS !== 'web') Vibration.vibrate([0, 30, 20, 30]);
+                SoundEffects.powerup();
+                break;
+            }
+        }
+
+        // Obstacles
+        for (const obs of obstaclesRef.current) {
+            if (Math.sqrt((obs.worldX - headX) ** 2 + (obs.worldY - headY) ** 2) < GAME_CONFIG.OBSTACLE_COLLISION_RADIUS) {
+                endGame();
+                return;
+            }
+        }
+
+        // AI snakes collision
+        const ais = aiSnakesRef.current;
+        const playerHead = playerWorldPosRef.current;
+        const history = positionHistoryRef.current;
+
+        for (const ai of ais) {
+            if (!ai.alive) continue;
+
+            const aiHead = ai.segments[0];
+
+            // AI head hits player body -> AI dies!
+            // Check more frequently for cornered AIs
+            for (let i = 2; i < Math.min(history.length, snakeLengthRef.current * 5); i += 2) {
+                const histPos = history[i];
+                if (!histPos) continue;
+
+                const segWorldX = playerHead.x + (histPos.x - CENTER_X);
+                const segWorldY = playerHead.y + (histPos.y - CENTER_Y);
+                const dist = Math.sqrt((aiHead.x - segWorldX) ** 2 + (aiHead.y - segWorldY) ** 2);
+
+                if (dist < 18) {
+                    killAI(ai);
+                    break;
+                }
+            }
+
+            if (!ai.alive) continue;
+
+            // === AI vs AI COLLISION ===
+            // When AI head hits another AI's body, the attacker (moving AI) dies
+            for (const otherAi of ais) {
+                if (otherAi.id === ai.id || !otherAi.alive) continue;
+
+                // Check if this AI's head hits other AI's body
+                for (let i = 1; i < otherAi.segments.length; i++) {
+                    const otherSeg = otherAi.segments[i];
+                    const dist = Math.sqrt((aiHead.x - otherSeg.x) ** 2 + (aiHead.y - otherSeg.y) ** 2);
+
+                    if (dist < 15) {
+                        // This AI crashed into other AI's body - this AI dies!
+                        killAI(ai);
+                        break;
+                    }
+                }
+
+                if (!ai.alive) break;
+            }
+
+            if (!ai.alive) continue;
+
+            // Player head hits AI body -> Player dies
+            // Use tighter collision - only die on actual contact
+            const playerHeadRadius = GAME_CONFIG.SNAKE_HEAD_SIZE / 2; // 10
+            const aiBodyRadius = GAME_CONFIG.SNAKE_SEGMENT_SIZE / 2; // 7
+            const contactDistance = playerHeadRadius + aiBodyRadius - 4; // ~13 - requires real overlap
+
+            for (let i = 1; i < ai.segments.length; i++) {
+                const seg = ai.segments[i];
+                const dist = Math.sqrt((seg.x - playerHead.x) ** 2 + (seg.y - playerHead.y) ** 2);
+                if (dist < contactDistance) {
+                    endGame();
+                    return;
+                }
+            }
+        }
+    };
+
+    const killAI = (ai) => {
+        ai.alive = false;
+        const bonusScore = ai.isBoss ? getBossReward(ai) : Math.floor(ai.length * 2 + ai.score / 4);
+        scoreRef.current += bonusScore;
+        setScore(scoreRef.current);
+
+        // Track AI kill
+        gameTracker.incrementAIKills();
+        gameTracker.updateScore(scoreRef.current);
+
+        // === BOSS DEFEAT CELEBRATION ===
+        if (ai.isBoss) {
+            setShowBossBattle(false);
+            setShowBossDefeat(true);
+            setBossDefeatBonus(bonusScore);
+            currentBossRef.current = null;
+            setCurrentBoss(null);
+
+            // Extra dramatic effects
+            if (Platform.OS !== 'web') Vibration.vibrate([0, 100, 50, 100, 50, 100, 50, 200]);
+            SoundEffects.levelup(); // Victory sound
+
+            // Boss defeat animation
+            bossDefeatAnim.setValue(0);
+            Animated.sequence([
+                Animated.spring(bossDefeatAnim, { toValue: 1, tension: 50, friction: 7, useNativeDriver: true }),
+                Animated.delay(2500),
+                Animated.timing(bossDefeatAnim, { toValue: 0, duration: 300, useNativeDriver: true }),
+            ]).start(() => setShowBossDefeat(false));
+        } else {
+            setKilledAI(`${ai.name} +${bonusScore}`);
+            addTimeout(() => setKilledAI(null), 800);
+        }
+
+        if (Platform.OS !== 'web') Vibration.vibrate([0, 80, 40, 80]);
+        SoundEffects.attack();
+
+        // Spawn candy trail
+        spawnCandyTrail(ai);
+
+        // Respawn AI later (but not boss - boss only spawns on level up)
+        if (!ai.isBoss) {
+            addTimeout(() => {
+                const idx = aiSnakesRef.current.indexOf(ai);
+                if (idx >= 0) {
+                    aiSnakesRef.current[idx] = createAISnake(idx);
+                    setAiSnakes([...aiSnakesRef.current]);
+                }
+            }, 5000);
+        }
+    };
+
+    const endGame = async () => {
+        gameStateRef.current = 'gameover';
+        setGameState('gameover');
+        stopGameLoop();
+        if (Platform.OS !== 'web') Vibration.vibrate([0, 60, 30, 60]);
+        SoundEffects.gameover();
+
+        // End session and save all data
+        gameTracker.updateLevel(currentLevelRef.current);
+        gameTracker.updateSnakeLength(snakeLengthRef.current);
+        await gameTracker.endSession();
+
+        if (updateHighScore && scoreRef.current > highScore) updateHighScore(scoreRef.current);
+    };
+
+    const handleJoystickMove = useCallback((x, y) => {
+        const mag = Math.sqrt(x * x + y * y);
+        if (mag > 0.08) { directionRef.current = { x: x / mag, y: y / mag }; isMovingRef.current = true; }
+    }, []);
+
+    const headRotation = snakeAngle + 90;
+
+    const renderSnakeBody = () => {
+        const segs = snakeSegments.slice(1);
+        return segs.map((seg, idx) => {
+            const progress = idx / Math.max(1, segs.length - 1);
+            const size = GAME_CONFIG.SNAKE_SEGMENT_SIZE * (1 - progress * 0.35);
+            let hue = currentSkinData.bodyHue === 'rainbow' ? (idx * 25 + Date.now() / 50) % 360 : currentSkinData.bodyHue;
+            const sat = currentSkinData.bodySaturation + progress * 10;
+            const light = currentSkinData.bodyLightness - progress * 12;
+            let segAngle = headRotation;
+            if (idx > 0 && segs[idx - 1]) segAngle = Math.atan2(seg.y - segs[idx - 1].y, seg.x - segs[idx - 1].x) * (180 / Math.PI) + 90;
+            return <View key={idx} style={[styles.snakeSegment, { left: seg.x - size / 2, top: seg.y - size / 2, width: size, height: size * 1.1, borderRadius: size / 2, backgroundColor: `hsl(${hue}, ${sat}%, ${light}%)`, transform: [{ rotate: `${segAngle}deg` }], zIndex: 50 - idx }]}><View style={styles.scaleShine} /></View>;
+        });
+    };
+
+    const renderAISnakes = () => aiSnakes.filter(ai => ai.alive).flatMap(ai => {
+        // Dynamic hue based on AI length - color evolves as they grow!
+        const lengthBonus = Math.floor(ai.length / 10) * 15;
+        const dynamicHue = (ai.bodyHue + lengthBonus) % 360;
+
+        // PERFORMANCE: Limit rendered segments (max 25) and skip every 2nd for long AIs
+        const maxRenderSegs = Math.min(ai.segments.length, 25);
+        const skipFactor = ai.segments.length > 30 ? 2 : 1;
+
+        const renderedSegs = [];
+        for (let idx = 0; idx < maxRenderSegs; idx++) {
+            // Skip segments for very long AIs (except head)
+            if (idx > 0 && idx % skipFactor !== 0) continue;
+
+            const seg = ai.segments[idx];
+            if (!seg) continue;
+
+            const screenX = CENTER_X + seg.x + worldOffset.x;
+            const screenY = CENTER_Y + seg.y + worldOffset.y;
+
+            // Stricter culling for performance
+            if (screenX < -100 || screenX > GAME_WIDTH + 100 || screenY < -100 || screenY > GAME_HEIGHT + 100) continue;
+
+            // EXACT SAME as player snake rendering (see renderSnakeBody)
+            // Player uses: size = SNAKE_SEGMENT_SIZE * (1 - progress * 0.35)
+            const isHead = idx === 0;
+            const bodySegCount = maxRenderSegs - 1;
+            const bodyIdx = idx - 1; // body index (0-based, excluding head)
+            const progress = bodyIdx / Math.max(1, bodySegCount - 1);
+
+            // Head: SNAKE_HEAD_SIZE (20), Body: SNAKE_SEGMENT_SIZE with same taper as player
+            const size = isHead
+                ? GAME_CONFIG.SNAKE_HEAD_SIZE
+                : GAME_CONFIG.SNAKE_SEGMENT_SIZE * (1 - progress * 0.35);
+
+            const light = 50 - progress * 12; // Same lightness formula as player
+            const sat = Math.min(75, 60 + (ai.length / 50) * 10);
+
+            let segAngle = 0;
+            if (idx > 0 && ai.segments[idx - 1]) {
+                segAngle = Math.atan2(seg.y - ai.segments[idx - 1].y, seg.x - ai.segments[idx - 1].x) * (180 / Math.PI) + 90;
+            }
+
+            const bgColor = isHead ? ai.headColor : `hsl(${dynamicHue}, ${sat}%, ${light}%)`;
+
+            renderedSegs.push(
+                <View
+                    key={`${ai.id}_${idx}`}
+                    style={[
+                        styles.aiSegmentNew,
+                        {
+                            left: screenX - size / 2,
+                            top: screenY - size / 2,
+                            width: size,
+                            height: isHead ? size * 1.15 : size,
+                            borderRadius: size / 2,
+                            backgroundColor: bgColor,
+                            transform: [{ rotate: `${segAngle}deg` }],
+                            zIndex: isHead ? 80 : 40 - idx
+                        }
+                    ]}
+                >
+                    <View style={styles.aiSegmentShine} />
+                    {isHead && (
+                        <View style={styles.aiEyes}>
+                            <View style={styles.aiEye}><View style={styles.aiPupil} /></View>
+                            <View style={styles.aiEye}><View style={styles.aiPupil} /></View>
+                        </View>
+                    )}
+                </View>
+            );
+        }
+        return renderedSegs;
+    });
+
+    const renderMinimap = () => {
+        const mapSize = 100;
+        const scale = mapSize / WORLD_SIZE;
+        const pX = mapSize / 2 + playerWorldPosRef.current.x * scale;
+        const pY = mapSize / 2 + playerWorldPosRef.current.y * scale;
+        return (
+            <View style={styles.minimapContainer}>
+                <View style={[styles.minimap, { width: mapSize, height: mapSize }]}>
+                    <View style={styles.minimapBorder} />
+                    {/* Food dots (green) */}
+                    {foods.slice(0, 15).map(f => {
+                        const fx = mapSize / 2 + f.worldX * scale;
+                        const fy = mapSize / 2 + f.worldY * scale;
+                        if (fx < 2 || fx > mapSize - 2 || fy < 2 || fy > mapSize - 2) return null;
+                        return <View key={f.id} style={[styles.minimapFood, { left: fx - 2, top: fy - 2 }]} />;
+                    })}
+                    {/* Obstacles (red) */}
+                    {obstacles.map(o => {
+                        const ox = mapSize / 2 + o.worldX * scale;
+                        const oy = mapSize / 2 + o.worldY * scale;
+                        if (ox < 2 || ox > mapSize - 2 || oy < 2 || oy > mapSize - 2) return null;
+                        return <View key={o.id} style={[styles.minimapObstacle, { left: ox - 3, top: oy - 3 }]} />;
+                    })}
+                    {/* AI snakes */}
+                    {aiSnakes.filter(ai => ai.alive).map(ai => {
+                        const ax = mapSize / 2 + ai.worldX * scale;
+                        const ay = mapSize / 2 + ai.worldY * scale;
+                        return <View key={ai.id} style={[styles.minimapDot, { backgroundColor: ai.headColor, width: 7, height: 7, left: ax - 3.5, top: ay - 3.5 }]} />;
+                    })}
+                    {/* Player (white with green border) */}
+                    <View style={[styles.minimapPlayer, { left: pX - 5, top: pY - 5 }]} />
+                </View>
+                {/* Legend */}
+                <View style={styles.minimapLegend}>
+                    <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: '#fff' }]} /><Text style={styles.legendText}>Sen</Text></View>
+                    <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: '#e91e63' }]} /><Text style={styles.legendText}>Rakip</Text></View>
+                    <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: '#4caf50' }]} /><Text style={styles.legendText}>Yem</Text></View>
+                    <View style={styles.legendItem}><View style={[styles.legendDot, { backgroundColor: '#ff5252' }]} /><Text style={styles.legendText}>Engel</Text></View>
+                </View>
+            </View>
+        );
+    };
+
+    const levelUpScale = levelUpAnim.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1] });
+    const comboScale = comboAnim.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1.1] });
+    const comboOpacity = comboAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 0.55] });
+    const eatenPopupScale = eatenPopupAnim.interpolate({ inputRange: [0, 1], outputRange: [1.2, 1] });
+
+    const getGameOverMessage = () => {
+        if (score >= highScore && score > 0) return '🏆 Efsanesin! Yeni rekor!';
+        if (score >= 2000) return '🎉 Harika gittin! Çok iyi oynadın!';
+        if (score >= 1000) return '💪 Güzel skor! Bir dahakine daha da iyi!';
+        if (currentLevel >= 5) return '⭐ Seviye atladın! Devam et!';
+        if (score >= 300) return '🐍 Fena değil! Tekrar dene!';
+        return '🌟 Bir dahakine daha iyi! Pes etme!';
+    };
+
+    return (
+        <View style={[styles.container, { backgroundColor: currentMapData?.bgColor || '#2a4a2a' }]}>
+            <StatusBar style="light" />
+
+            <View style={styles.header}>
+                <View style={styles.levelInfo}><Text style={styles.levelLabel}>LV.{currentLevel}</Text><Text style={styles.levelTitle}>{currentLevelData?.title}</Text></View>
+                <View style={styles.scoreSection}><Text style={styles.scoreValue}>{score}</Text></View>
+                <View style={styles.lengthSection}><Text style={styles.lengthEmoji}>🐍</Text><Text style={styles.lengthValue}>{snakeLengthRef.current}</Text></View>
+                {gameState === 'playing' && <TouchableOpacity style={styles.pauseBtn} onPress={togglePause}><Text style={styles.pauseBtnText}>{isPaused ? '▶' : '⏸'}</Text></TouchableOpacity>}
+                <TouchableOpacity style={styles.closeBtn} onPress={onBackToHome}><Text style={styles.closeBtnText}>✕</Text></TouchableOpacity>
+            </View>
+
+            <View style={styles.progressContainer}>
+                <View style={styles.progressBar}><View style={[styles.progressFill, { width: `${progressToNextLevel}%` }]} /></View>
+                <View style={styles.progressInfo}><Text style={styles.zoneText}>{currentMapData?.icon} {currentMapData?.name}</Text><Text style={styles.progressText}>{score}/{currentLevelData?.targetScore}</Text></View>
+            </View>
+            {(activePowerupExpires.speed || activePowerupExpires.double) && (
+                <View style={styles.powerupsBar}>
+                    {activePowerupExpires.speed && Date.now() < activePowerupExpires.speed && (
+                        <View style={[styles.activePowerup, { backgroundColor: 'rgba(255,193,7,0.25)' }]}>
+                            <Text style={styles.powerupEmoji}>⚡</Text>
+                            <Text style={styles.powerupTime}>{Math.ceil((activePowerupExpires.speed - powerupTick) / 1000)}s</Text>
+                        </View>
+                    )}
+                    {activePowerupExpires.double && Date.now() < activePowerupExpires.double && (
+                        <View style={[styles.activePowerup, { backgroundColor: 'rgba(156,39,176,0.25)' }]}>
+                            <Text style={styles.powerupEmoji}>✖️</Text>
+                            <Text style={styles.powerupTime}>{Math.ceil((activePowerupExpires.double - powerupTick) / 1000)}s</Text>
+                        </View>
+                    )}
+                </View>
+            )}
+
+            <View style={styles.gameArea}>
+                <View style={[styles.forestFloor, { backgroundColor: currentMapData?.bgColor }]}>
+                    {/* Subtle vignette overlay - softer edges */}
+                    <LinearGradient
+                        colors={['rgba(0,0,0,0.06)', 'transparent', 'transparent', 'rgba(0,0,0,0.07)']}
+                        locations={[0, 0.18, 0.82, 1]}
+                        style={StyleSheet.absoluteFill}
+                        pointerEvents="none"
+                    />
+                    {HexagonGrid}
+
+                    {decorations.map(d => {
+                        const sX = CENTER_X + d.x + worldOffset.x, sY = CENTER_Y + d.y + worldOffset.y;
+                        if (sX < -200 || sX > GAME_WIDTH + 200 || sY < -200 || sY > GAME_HEIGHT + 200) return null;
+                        return <Text key={d.id} style={{ position: 'absolute', left: sX, top: sY, fontSize: d.size, opacity: d.opacity }}>{d.emoji}</Text>;
+                    })}
+
+                    {/* Candy trail from dead AI - with wrap support */}
+                    {candies.flatMap(c => {
+                        const positions = getWrapPositions(c.worldX, c.worldY, worldOffset.x, worldOffset.y, 200);
+                        return positions.map((pos, posIdx) => {
+                            if (pos.x < -50 || pos.x > GAME_WIDTH + 50 || pos.y < -50 || pos.y > GAME_HEIGHT + 50) return null;
+                            return <Text key={`${c.id}_${posIdx}`} style={[styles.candy, { left: pos.x - c.size / 2, top: pos.y - c.size / 2, fontSize: c.size }]}>{c.emoji}</Text>;
+                        });
+                    })}
+
+                    {/* Foods - gerçekçi av görünümü, yuvarlak zemin + gölge */}
+                    {foods.flatMap(f => {
+                        const positions = getWrapPositions(f.worldX, f.worldY, worldOffset.x, worldOffset.y, 200);
+                        const box = f.size + 12;
+                        return positions.map((pos, posIdx) => {
+                            if (pos.x < -50 || pos.x > GAME_WIDTH + 50 || pos.y < -50 || pos.y > GAME_HEIGHT + 50) return null;
+                            return (
+                                <View key={`${f.id}_${posIdx}`} style={[styles.food, styles.foodRealistic, { left: pos.x - box / 2, top: pos.y - box / 2, width: box, height: box, borderRadius: box / 2 }]}>
+                                    <View style={styles.foodGround} />
+                                    <Text style={[styles.foodEmoji, { fontSize: f.size }]}>{f.emoji}</Text>
+                                </View>
+                            );
+                        });
+                    })}
+
+                    {/* Power-ups - speed & 2x */}
+                    {powerups.flatMap(pu => {
+                        const positions = getWrapPositions(pu.worldX, pu.worldY, worldOffset.x, worldOffset.y, 200);
+                        return positions.map((pos, posIdx) => {
+                            if (pos.x < -50 || pos.x > GAME_WIDTH + 50 || pos.y < -50 || pos.y > GAME_HEIGHT + 50) return null;
+                            return <View key={`${pu.id}_${posIdx}`} style={[styles.powerupInWorld, { left: pos.x - pu.size / 2 - 4, top: pos.y - pu.size / 2 - 4, borderColor: pu.color }]}><Text style={{ fontSize: pu.size }}>{pu.emoji}</Text></View>;
+                        });
+                    })}
+
+                    {/* OBSTACLES - with danger warning ring and smooth wrap */}
+                    {obstacles.flatMap(o => {
+                        const positions = getWrapPositions(o.worldX, o.worldY, worldOffset.x, worldOffset.y, 200);
+                        return positions.map((pos, posIdx) => {
+                            if (pos.x < -50 || pos.x > GAME_WIDTH + 50 || pos.y < -50 || pos.y > GAME_HEIGHT + 50) return null;
+                            return (
+                                <View key={`${o.id}_${posIdx}`} style={[styles.obstacleContainer, { left: pos.x - o.size / 2 - 8, top: pos.y - o.size / 2 - 8 }]}>
+                                    <View style={styles.dangerRing} />
+                                    <View style={styles.obstacleInner}>
+                                        <Text style={{ fontSize: o.size - 4 }}>{o.emoji}</Text>
+                                    </View>
+                                </View>
+                            );
+                        });
+                    })}
+
+                    {renderAISnakes()}
+                    {renderSnakeBody()}
+
+                    <View style={[styles.snakeHead, { left: CENTER_X - GAME_CONFIG.SNAKE_HEAD_SIZE / 2, top: CENTER_Y - GAME_CONFIG.SNAKE_HEAD_SIZE / 2, transform: [{ rotate: `${headRotation}deg` }], backgroundColor: currentSkinData.headColor }]}>
+                        <View style={styles.headHighlight} />
+                        <View style={styles.eyeRow}><View style={[styles.eye, { backgroundColor: currentSkinData.eyeColor }]}><View style={styles.pupil} /></View><View style={[styles.eye, { backgroundColor: currentSkinData.eyeColor }]}><View style={styles.pupil} /></View></View>
+                        <View style={styles.tongueBase}><View style={[styles.tongue, { backgroundColor: currentSkinData.tongueColor }]}><View style={[styles.tongueForkL, { backgroundColor: currentSkinData.tongueColor }]} /><View style={[styles.tongueForkR, { backgroundColor: currentSkinData.tongueColor }]} /></View></View>
+                    </View>
+                </View>
+
+
+                {lastEaten && (
+                    <Animated.View style={[styles.eatenPopup, { transform: [{ scale: eatenPopupScale }] }]}>
+                        <Text style={styles.eatenEmoji}>{lastEaten.emoji}</Text>
+                        <Text style={styles.eatenPoints}>+{lastEaten.points}</Text>
+                    </Animated.View>
+                )}
+                {showCombo >= 2 && (
+                    <Animated.View style={[styles.comboPopup, { opacity: comboOpacity, transform: [{ scale: comboScale }] }]}>
+                        <Text style={styles.comboText}>🔥 {showCombo}x</Text>
+                    </Animated.View>
+                )}
+                {killedAI && <View style={styles.killedPopup}><Text style={styles.killedText}>💀 {killedAI}</Text></View>}
+                {showLevelUp && <Animated.View style={[styles.levelUpBanner, { opacity: levelUpAnim, transform: [{ scale: levelUpScale }] }]}><Text style={styles.levelUpText}>🎉 SEVİYE {currentLevel}!</Text></Animated.View>}
+                {showZoneChange && <Animated.View style={[styles.zoneBannerTop, { opacity: zoneChangeAnim }]}><Text style={{ fontSize: 16 }}>{currentMapData?.icon}</Text><Text style={styles.zoneNameSmall}>{currentMapData?.name}</Text></Animated.View>}
+            </View>
+
+            {/* === BOSS WARNING - Small Top Banner (doesn't block gameplay) === */}
+            {showBossWarning && (
+                <Animated.View style={[styles.bossWarningBanner, { opacity: bossWarningAnim }]}>
+                    <Text style={styles.bossWarningBannerText}>⚠️ BOSS YAKLAŞIYOR! ⚠️</Text>
+                </Animated.View>
+            )}
+
+            {/* === BOSS BATTLE INDICATOR === */}
+            {showBossBattle && currentBoss && (
+                <View style={styles.bossBattleIndicator}>
+                    <Text style={styles.bossBattleText}>
+                        👹 BOSS: {currentBoss.name} 👹
+                    </Text>
+                </View>
+            )}
+
+            {/* === BOSS DEFEAT CELEBRATION === */}
+            {showBossDefeat && (
+                <Animated.View style={[styles.bossDefeatOverlay, { opacity: bossDefeatAnim }]}>
+                    <Animated.View style={[styles.bossDefeatBox, {
+                        transform: [{ scale: bossDefeatAnim }]
+                    }]}>
+                        <Text style={styles.bossDefeatEmoji}>🎉</Text>
+                        <Text style={styles.bossDefeatTitle}>BOSS YENİLDİ!</Text>
+                        <Text style={styles.bossDefeatBonus}>+{bossDefeatBonus} PUAN!</Text>
+                        <Text style={styles.bossDefeatEmoji}>🎉</Text>
+                    </Animated.View>
+                </Animated.View>
+            )}
+
+            {showTutorial && (
+                <View style={styles.tutorialOverlay}>
+                    <View style={styles.tutorialBox}>
+                        <Text style={styles.tutorialTitle}>🐍 SLİTHER PLANET</Text>
+                        <Text style={styles.tutorialItem}>✅ Hayvanları ve şekerleri ye</Text>
+                        <Text style={styles.tutorialItem}>🔥 Arka arkaya ye = Kombo! +2, +3 ekstra puan</Text>
+                        <Text style={styles.tutorialItem}>⚡ Hız & ✖️ 2x puan power-up'ları topla</Text>
+                        <Text style={styles.tutorialItem}>❌ Engellere çarpma</Text>
+                        <Text style={styles.tutorialItem}>🤖 Rakip yılanlara dikkat! 💀 Öldür = Şeker!</Text>
+                        <TouchableOpacity style={styles.startBtn} onPress={startPlaying}><Text style={styles.startBtnText}>🎮 BAŞLA</Text></TouchableOpacity>
+                    </View>
+                </View>
+            )}
+
+            <View style={styles.controlsArea}>
+                {renderMinimap()}
+                <Joystick onMove={handleJoystickMove} onRelease={() => { }} />
+            </View>
+
+            {isPaused && gameState === 'playing' && (
+                <View style={styles.pauseOverlay}>
+                    <View style={styles.pauseBox}>
+                        <Text style={styles.pauseEmoji}>⏸️</Text>
+                        <Text style={styles.pauseTitle}>DURAKLATILDI</Text>
+                        <TouchableOpacity style={styles.resumeBtn} onPress={togglePause}>
+                            <Text style={styles.resumeBtnText}>▶ DEVAM ET</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.menuBtn} onPress={onBackToHome}>
+                            <Text style={styles.menuText}>🏠 MENÜYE DÖN</Text>
+                        </TouchableOpacity>
+                    </View>
+                </View>
+            )}
+
+            {gameState === 'gameover' && (
+                <View style={styles.gameOverOverlay}>
+                    <View style={styles.gameOverBox}>
+                        <Text style={styles.gameOverEmoji}>💀</Text>
+                        <Text style={styles.gameOverTitle}>OYUN BİTTİ!</Text>
+                        <Text style={styles.gameOverMessage}>{getGameOverMessage()}</Text>
+                        <View style={styles.statsContainer}>
+                            <View style={styles.statsRow}><Text style={styles.statLabel}>🎯 Skor</Text><Text style={styles.statValue}>{score}</Text></View>
+                            <View style={styles.statsRow}><Text style={styles.statLabel}>📊 Seviye</Text><Text style={styles.statValue}>{currentLevel}</Text></View>
+                            <View style={styles.statsRow}><Text style={styles.statLabel}>🐍 Uzunluk</Text><Text style={styles.statValue}>{snakeLengthRef.current}</Text></View>
+                        </View>
+                        {score >= highScore && score > 0 && <Text style={styles.newRecord}>🏆 YENİ REKOR! 🏆</Text>}
+                        <TouchableOpacity style={styles.restartBtn} onPress={initGame}><Text style={styles.restartText}>🔄 TEKRAR</Text></TouchableOpacity>
+                        <TouchableOpacity style={styles.menuBtn} onPress={onBackToHome}><Text style={styles.menuText}>🏠 MENÜ</Text></TouchableOpacity>
+                    </View>
+                </View>
+            )}
+        </View>
+    );
+};
+
+const styles = StyleSheet.create({
+    container: { flex: 1 },
+    header: { flexDirection: 'row', alignItems: 'center', paddingTop: 40, paddingHorizontal: 10, paddingBottom: 3, backgroundColor: 'rgba(0,0,0,0.4)' },
+    levelInfo: { flex: 1 },
+    levelLabel: { fontSize: 10, color: COLORS.LEVEL_UP, fontWeight: 'bold' },
+    levelTitle: { fontSize: 8, color: COLORS.UI_TEXT },
+    scoreSection: { alignItems: 'center', paddingHorizontal: 8 },
+    scoreValue: { fontSize: 16, fontWeight: 'bold', color: COLORS.UI_GOLD },
+    lengthSection: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(139,195,74,0.15)', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 5, marginHorizontal: 5 },
+    lengthEmoji: { fontSize: 10 },
+    lengthValue: { fontSize: 11, fontWeight: 'bold', color: COLORS.UI_PRIMARY, marginLeft: 2 },
+    closeBtn: { width: 24, height: 24, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center' },
+    closeBtnText: { fontSize: 12, color: COLORS.UI_TEXT },
+    progressContainer: { paddingHorizontal: 10, paddingVertical: 2, backgroundColor: 'rgba(0,0,0,0.25)' },
+    progressBar: { height: 3, backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 1.5, overflow: 'hidden' },
+    progressFill: { height: '100%', backgroundColor: COLORS.LEVEL_UP, borderRadius: 1.5 },
+    progressInfo: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 1 },
+    zoneText: { fontSize: 8, color: 'rgba(255,255,255,0.6)' },
+    progressText: { fontSize: 7, color: 'rgba(255,255,255,0.4)' },
+    powerupsBar: { flexDirection: 'row', justifyContent: 'center', padding: 4, gap: 8, backgroundColor: 'rgba(0,0,0,0.25)' },
+    activePowerup: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12, gap: 4 },
+    powerupEmoji: { fontSize: 14 },
+    powerupTime: { fontSize: 11, fontWeight: 'bold', color: '#fff' },
+    gameArea: { flex: 1, overflow: 'hidden' },
+    forestFloor: { flex: 1, overflow: 'hidden' },
+    powerupInWorld: { position: 'absolute', alignItems: 'center', justifyContent: 'center', borderRadius: 18, borderWidth: 2, padding: 4, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 65, shadowColor: '#fff', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.5, shadowRadius: 8, elevation: 8 },
+    candy: { position: 'absolute', zIndex: 62, textShadowColor: 'rgba(255,255,255,0.8)', textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 6 },
+    food: { position: 'absolute', zIndex: 60, alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
+    foodRealistic: { backgroundColor: 'transparent', shadowColor: '#1a1208', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.5, shadowRadius: 5, elevation: 6 },
+    foodGround: { position: 'absolute', top: 2, left: 2, right: 2, bottom: 2, borderRadius: 999, backgroundColor: 'rgba(45,35,20,0.65)', borderWidth: 1, borderColor: 'rgba(80,60,35,0.5)' },
+    foodEmoji: { textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 2 },
+    obstacle: { position: 'absolute', zIndex: 55, backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 8, padding: 3, borderWidth: 1, borderColor: 'rgba(255,0,0,0.3)', shadowColor: '#ff0000', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.3, shadowRadius: 6, elevation: 4 },
+    snakeSegment: { position: 'absolute', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(0,0,0,0.4)', shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.3, shadowRadius: 3, elevation: 4 },
+    scaleShine: { position: 'absolute', top: '15%', width: '45%', height: '25%', backgroundColor: 'rgba(255,255,255,0.18)', borderRadius: 8 },
+    snakeHead: { position: 'absolute', width: GAME_CONFIG.SNAKE_HEAD_SIZE, height: GAME_CONFIG.SNAKE_HEAD_SIZE * 1.15, borderRadius: GAME_CONFIG.SNAKE_HEAD_SIZE / 2.2, alignItems: 'center', borderWidth: 2, borderColor: 'rgba(0,0,0,0.5)', zIndex: 100, overflow: 'visible', shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.5, shadowRadius: 5, elevation: 10 },
+    shieldGlow: { position: 'absolute', width: 32, height: 32, borderRadius: 16, borderWidth: 2, borderColor: '#4fc3f7', top: -6, left: -6 },
+    headHighlight: { position: 'absolute', top: 2, left: '15%', width: '35%', height: '22%', backgroundColor: 'rgba(255,255,255,0.25)', borderRadius: 4 },
+    eyeRow: { flexDirection: 'row', justifyContent: 'space-between', width: '65%', marginTop: 3 },
+    eye: { width: 5, height: 5, borderRadius: 2.5, alignItems: 'center', justifyContent: 'center' },
+    pupil: { width: 2.5, height: 3, borderRadius: 1.25, backgroundColor: '#111' },
+    tongueBase: { position: 'absolute', bottom: -7 },
+    tongue: { width: 2, height: 8 },
+    tongueForkL: { position: 'absolute', bottom: 0, left: -1.5, width: 2, height: 3.5, transform: [{ rotate: '-30deg' }] },
+    tongueForkR: { position: 'absolute', bottom: 0, right: -1.5, width: 2, height: 3.5, transform: [{ rotate: '30deg' }] },
+    aiHead: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
+    aiSegment: { position: 'absolute' },
+    aiSegmentNew: { position: 'absolute', alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(0,0,0,0.3)', shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.3, shadowRadius: 2, elevation: 3 },
+    aiSegmentShine: { position: 'absolute', top: '12%', width: '40%', height: '22%', backgroundColor: 'rgba(255,255,255,0.25)', borderRadius: 6 },
+    aiEyes: { flexDirection: 'row', justifyContent: 'space-between', width: '65%', marginTop: 2 },
+    aiEye: { width: 4, height: 4, borderRadius: 2, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
+    aiPupil: { width: 2, height: 2.5, borderRadius: 1, backgroundColor: '#111' },
+    eatenPopup: { position: 'absolute', top: '12%', alignSelf: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.75)', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 8, borderWidth: 1.5, borderColor: COLORS.UI_PRIMARY, zIndex: 200 },
+    eatenEmoji: { fontSize: 22 },
+    eatenPoints: { fontSize: 11, fontWeight: 'bold', color: COLORS.UI_PRIMARY },
+    comboPopup: { position: 'absolute', top: 8, right: 12, backgroundColor: 'rgba(255,152,0,0.35)', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, borderWidth: 1, borderColor: 'rgba(255,213,79,0.4)', zIndex: 210 },
+    comboText: { fontSize: 10, fontWeight: '600', color: 'rgba(255,255,255,0.9)', textShadowColor: 'rgba(0,0,0,0.3)', textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 2 },
+    killedPopup: { position: 'absolute', top: '22%', alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.85)', paddingHorizontal: 14, paddingVertical: 5, borderRadius: 10, borderWidth: 2, borderColor: '#e91e63', zIndex: 200 },
+    killedText: { fontSize: 12, fontWeight: 'bold', color: '#e91e63' },
+    levelUpBanner: { position: 'absolute', top: 5, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.85)', paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12, borderWidth: 1.5, borderColor: COLORS.LEVEL_UP, zIndex: 300 },
+    levelUpText: { fontSize: 11, fontWeight: 'bold', color: COLORS.LEVEL_UP },
+    zoneBannerTop: { position: 'absolute', top: 5, right: 10, flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.75)', paddingHorizontal: 10, paddingVertical: 3, borderRadius: 10, gap: 5, zIndex: 290 },
+    zoneNameSmall: { fontSize: 10, fontWeight: 'bold', color: COLORS.UI_GOLD },
+    tutorialOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.92)', alignItems: 'center', justifyContent: 'center', zIndex: 400 },
+    tutorialBox: { backgroundColor: 'rgba(25,45,30,0.98)', borderRadius: 16, padding: 18, alignItems: 'center', width: width * 0.8, borderWidth: 2, borderColor: COLORS.UI_PRIMARY },
+    tutorialTitle: { fontSize: 17, fontWeight: 'bold', color: COLORS.UI_TEXT, marginBottom: 12 },
+    tutorialItem: { fontSize: 12, color: 'rgba(255,255,255,0.85)', marginVertical: 3 },
+    startBtn: { backgroundColor: COLORS.UI_PRIMARY, paddingVertical: 11, paddingHorizontal: 40, borderRadius: 20, marginTop: 12 },
+    startBtnText: { fontSize: 15, fontWeight: 'bold', color: COLORS.UI_TEXT },
+    controlsArea: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'center', paddingVertical: 5, paddingBottom: 18, backgroundColor: 'rgba(0,0,0,0.4)', gap: 15 },
+    minimapContainer: { alignItems: 'center' },
+    minimap: { backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 10, overflow: 'hidden' },
+    minimapBorder: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, borderWidth: 2, borderColor: 'rgba(255,255,255,0.3)', borderRadius: 10 },
+    minimapDot: { position: 'absolute', borderRadius: 4 },
+    minimapFood: { position: 'absolute', width: 4, height: 4, borderRadius: 2, backgroundColor: '#4caf50' },
+    minimapObstacle: { position: 'absolute', width: 6, height: 6, borderRadius: 1, backgroundColor: '#ff5252' },
+    minimapPlayer: { position: 'absolute', width: 10, height: 10, borderRadius: 5, backgroundColor: '#fff', borderWidth: 2, borderColor: '#8bc34a' },
+    minimapLegend: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 4, gap: 4 },
+    legendItem: { flexDirection: 'row', alignItems: 'center', gap: 2 },
+    legendDot: { width: 6, height: 6, borderRadius: 3 },
+    legendText: { fontSize: 7, color: 'rgba(255,255,255,0.6)' },
+    gameOverOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.92)', alignItems: 'center', justifyContent: 'center', zIndex: 500 },
+    gameOverBox: { backgroundColor: 'rgba(20,35,25,0.98)', borderRadius: 16, padding: 18, alignItems: 'center', borderWidth: 2, borderColor: COLORS.UI_DANGER, width: width * 0.75 },
+    gameOverEmoji: { fontSize: 35 },
+    gameOverTitle: { fontSize: 16, fontWeight: 'bold', color: COLORS.UI_DANGER, marginVertical: 4 },
+    gameOverMessage: { fontSize: 13, color: 'rgba(255,255,255,0.85)', marginBottom: 8, textAlign: 'center', paddingHorizontal: 16 },
+    statsContainer: { width: '100%', backgroundColor: 'rgba(0,0,0,0.25)', borderRadius: 8, padding: 8, marginBottom: 6 },
+    statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginVertical: 1 },
+    statLabel: { fontSize: 11, color: 'rgba(255,255,255,0.6)' },
+    statValue: { fontSize: 12, fontWeight: 'bold', color: COLORS.UI_TEXT },
+    newRecord: { fontSize: 12, fontWeight: 'bold', color: COLORS.UI_GOLD, marginBottom: 6 },
+    restartBtn: { backgroundColor: COLORS.UI_PRIMARY, paddingVertical: 9, paddingHorizontal: 28, borderRadius: 14, marginTop: 3 },
+    restartText: { fontSize: 12, fontWeight: 'bold', color: COLORS.UI_TEXT },
+    menuBtn: { marginTop: 7 },
+    menuText: { fontSize: 10, color: 'rgba(255,255,255,0.5)' },
+    pauseBtn: { width: 28, height: 28, borderRadius: 14, backgroundColor: 'rgba(255,193,7,0.3)', alignItems: 'center', justifyContent: 'center', marginRight: 6 },
+    pauseBtnText: { fontSize: 14, color: '#ffc107' },
+    pauseOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.85)', alignItems: 'center', justifyContent: 'center', zIndex: 450 },
+    pauseBox: { backgroundColor: 'rgba(25,45,30,0.98)', borderRadius: 16, padding: 24, alignItems: 'center', borderWidth: 2, borderColor: '#ffc107', width: width * 0.7 },
+    pauseEmoji: { fontSize: 50 },
+    pauseTitle: { fontSize: 18, fontWeight: 'bold', color: '#ffc107', marginVertical: 12 },
+    resumeBtn: { backgroundColor: COLORS.UI_PRIMARY, paddingVertical: 12, paddingHorizontal: 35, borderRadius: 16, marginTop: 8 },
+    resumeBtnText: { fontSize: 14, fontWeight: 'bold', color: COLORS.UI_TEXT },
+    // Boss UI Styles - Small Top Banner (doesn't block gameplay)
+    bossWarningBanner: { position: 'absolute', top: 100, left: 20, right: 20, alignItems: 'center', zIndex: 450, pointerEvents: 'none' },
+    bossWarningBannerText: { fontSize: 16, fontWeight: 'bold', color: '#fff', backgroundColor: 'rgba(139,0,0,0.95)', paddingHorizontal: 25, paddingVertical: 10, borderRadius: 25, borderWidth: 2, borderColor: '#ff0000', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
+
+    bossBattleIndicator: { position: 'absolute', top: 100, left: 20, right: 20, alignItems: 'center', zIndex: 400, pointerEvents: 'none' },
+    bossBattleText: { fontSize: 14, fontWeight: 'bold', color: '#ffd700', backgroundColor: 'rgba(139,0,0,0.9)', paddingHorizontal: 20, paddingVertical: 8, borderRadius: 20, borderWidth: 2, borderColor: '#ffd700' },
+
+    // Boss Defeat Banner
+    bossDefeatOverlay: { position: 'absolute', top: 100, left: 20, right: 20, alignItems: 'center', zIndex: 450, pointerEvents: 'none' },
+    bossDefeatBox: { backgroundColor: '#4a3408', borderRadius: 20, paddingHorizontal: 25, paddingVertical: 12, alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 3, borderColor: '#ffd700' },
+    bossDefeatEmoji: { fontSize: 24 },
+    bossDefeatTitle: { fontSize: 16, fontWeight: 'bold', color: '#ffd700' },
+    bossDefeatBonus: { fontSize: 14, fontWeight: 'bold', color: '#fff' },
+
+    // OBSTACLE with danger ring - more prominent warning
+    obstacleContainer: { position: 'absolute', zIndex: 55, alignItems: 'center', justifyContent: 'center', width: 48, height: 48 },
+    dangerRing: { position: 'absolute', width: 48, height: 48, borderRadius: 24, borderWidth: 3, borderColor: 'rgba(255,0,0,0.7)', borderStyle: 'dashed' },
+    obstacleInner: { backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 10, padding: 4, borderWidth: 2, borderColor: 'rgba(255,0,0,0.5)' },
+});
+
+export default GameScreen;
