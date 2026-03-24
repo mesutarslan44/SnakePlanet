@@ -131,49 +131,44 @@ const GameScreen = ({ onBackToHome, updateHighScore, highScore = 0, selectedSkin
     const currentLevelData = getLevelData(currentLevel);
     const progressToNextLevel = currentLevelData ? Math.min(100, (score / currentLevelData.targetScore) * 100) : 100;
 
-    // Yıldız Arka Planı (Starfield) - 3D Parallax Space Theme
-    const BackgroundPattern = useMemo(() => {
-        const stars = [];
-        const areaW = GAME_WIDTH * 1.5;
-        const areaH = GAME_HEIGHT * 1.5;
+    // Petek (hexagon) arka plan – View tabanlı, react-native-svg gerekmez
+    const HexagonGrid = useMemo(() => {
+        const hexSize = 40;
+        const hexHeight = hexSize * Math.sqrt(3);
+        const hexWidth = hexSize * 2;
+        const cols = Math.ceil(GAME_WIDTH / (hexWidth * 0.75)) + 2;
+        const rows = Math.ceil(GAME_HEIGHT / hexHeight) + 2;
+        const gridColor = 'rgba(255, 255, 255, 0.08)';
 
-        // 3 Layers of depth
-        // Far: Small, dim, moves slow
-        // Mid: Medium, normal brightness
-        // Near: Large, bright, moves fast
-
-        for (let i = 0; i < 100; i++) {
-            const depth = Math.random();
-            let layer, size, opacity, parallaxFactor;
-
-            if (depth < 0.5) { // 50% Far
-                layer = 'far';
-                size = Math.random() * 1.5 + 1; // 1-2.5px
-                opacity = Math.random() * 0.3 + 0.1;
-                parallaxFactor = 0.15; // Moves very slowly (distant)
-            } else if (depth < 0.85) { // 35% Mid
-                layer = 'mid';
-                size = Math.random() * 2 + 2; // 2-4px
-                opacity = Math.random() * 0.4 + 0.3;
-                parallaxFactor = 0.4;
-            } else { // 15% Near
-                layer = 'near';
-                size = Math.random() * 3 + 3; // 3-6px
-                opacity = Math.random() * 0.4 + 0.6;
-                parallaxFactor = 0.85; // Moves almost as fast as foreground
+        const hexagons = [];
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const x = col * hexWidth * 0.75;
+                const y = row * hexHeight + (col % 2 === 1 ? hexHeight / 2 : 0);
+                hexagons.push(
+                    <View
+                        key={`hex_${row}_${col}`}
+                        style={{
+                            position: 'absolute',
+                            left: x - hexSize,
+                            top: y - hexHeight / 2,
+                            width: hexSize * 2,
+                            height: hexHeight,
+                            borderWidth: 1,
+                            borderColor: gridColor,
+                            backgroundColor: 'transparent',
+                            transform: [{ rotate: '30deg' }],
+                            borderRadius: hexSize / 3,
+                        }}
+                    />
+                );
             }
-
-            stars.push({
-                id: i,
-                x: Math.random() * areaW,
-                y: Math.random() * areaH,
-                size,
-                opacity,
-                parallaxFactor,
-                layer
-            });
         }
-        return stars;
+        return (
+            <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, overflow: 'hidden', opacity: 0.6 }}>
+                {hexagons}
+            </View>
+        );
     }, []);
 
     const decorations = useMemo(() => {
@@ -1296,50 +1291,7 @@ const GameScreen = ({ onBackToHome, updateHighScore, highScore = 0, selectedSkin
                         style={StyleSheet.absoluteFill}
                         pointerEvents="none"
                     />
-                    {/* Dynamic Star Field with 3D Parallax */}
-                    {BackgroundPattern.map(star => {
-                        // Use star-specific parallax factor
-                        const parallaxX = worldOffset.x * star.parallaxFactor;
-                        const parallaxY = worldOffset.y * star.parallaxFactor;
-
-                        const areaW = GAME_WIDTH * 1.5;
-                        const areaH = GAME_HEIGHT * 1.5;
-
-                        let left = (star.x + parallaxX) % areaW;
-                        let top = (star.y + parallaxY) % areaH;
-
-                        // Fix negative modulus
-                        if (left < 0) left += areaW;
-                        if (top < 0) top += areaH;
-
-                        // Center them relative to screen
-                        left -= areaW * 0.25;
-                        top -= areaH * 0.25;
-
-                        // Cull if well outside
-                        if (left < -20 || left > GAME_WIDTH + 20 || top < -20 || top > GAME_HEIGHT + 20) return null;
-
-                        return (
-                            <View
-                                key={`star_${star.id}`}
-                                style={{
-                                    position: 'absolute',
-                                    left: left,
-                                    top: top,
-                                    width: star.size,
-                                    height: star.size,
-                                    borderRadius: star.size / 2,
-                                    backgroundColor: star.layer === 'near' ? '#e0f7fa' : 'white', // Slight tint for near stars
-                                    opacity: star.opacity,
-                                    shadowColor: star.layer === 'near' ? '#4fc3f7' : 'white', // Glow for near stars
-                                    shadowOffset: { width: 0, height: 0 },
-                                    shadowOpacity: star.layer === 'near' ? 0.8 : 0.5,
-                                    shadowRadius: star.layer === 'near' ? 6 : 4,
-                                    zIndex: star.layer === 'near' ? 10 : 0, // Draw near stars on top of far ones
-                                }}
-                            />
-                        );
-                    })}
+                    {HexagonGrid}
 
                     {decorations.map(d => {
                         const sX = CENTER_X + d.x + worldOffset.x, sY = CENTER_Y + d.y + worldOffset.y;

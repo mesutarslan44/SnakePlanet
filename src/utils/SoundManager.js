@@ -1,13 +1,14 @@
 // 🔊 Sound Manager for SnakePlanet
+// Ses dosyalarını değiştirmek için: proje kökündeki SES_EFFEKTLERI_REHBERI.md
 import { Audio } from 'expo-av';
 
-// Sound file imports
+// Sound file imports – assets/sounds/ (MP3)
 const SOUNDS = {
-    eat: require('../../assets/sounds/capture.mp3'),
+    eat: require('../../assets/sounds/music_food.mp3'),
     attack: require('../../assets/sounds/attack.mp3'),
     powerup: require('../../assets/sounds/powerup.mp3'),
     levelup: require('../../assets/sounds/victory.mp3'),
-    gameover: require('../../assets/sounds/defeat.mp3'),
+    gameover: require('../../assets/sounds/music_gameover.mp3'),
     select: require('../../assets/sounds/select.mp3'),
 };
 

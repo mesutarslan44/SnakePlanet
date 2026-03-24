@@ -5,7 +5,7 @@ export const GAME_CONFIG = {
     WORLD_HALF: 2400,
 
     // Snake
-    SNAKE_SPEED: 3.6,   // Slightly faster for snappier feel (was 3.2)
+    SNAKE_SPEED: 3.2,  // Hızlandırıldı (was 2.85)
     SNAKE_HEAD_SIZE: 20,
     SNAKE_SEGMENT_SIZE: 14,
     SNAKE_INITIAL_LENGTH: 5,
@@ -13,7 +13,7 @@ export const GAME_CONFIG = {
 
     // AI Snakes - Smarter & Longer-lived
     AI_SNAKE_COUNT: 6,        // Bumped for larger world (was 4)
-    AI_SNAKE_SPEED: 2.9,           // Slightly faster for fluid feel in larger world (was 2.6)
+    AI_SNAKE_SPEED: 2.2,          // Biraz daha yavaşlatıldı (was 2.35)
     AI_SNAKE_INITIAL_LENGTH: 5,    // Same as player SNAKE_INITIAL_LENGTH
     AI_TURN_CHANCE: 0.015,         // Less random turning (was 0.03)
     AI_HUNT_RADIUS: 180,           // Larger hunt radius (was 120)
@@ -21,11 +21,12 @@ export const GAME_CONFIG = {
     AI_OBSTACLE_AVOID_RADIUS: 60,  // Distance to detect obstacles
     AI_WALL_AVOID_RADIUS: 100,     // Distance to avoid world edges
 
-    // Collision
+    // Collision – tam temas: ölüm sadece gerçek temas halinde
     FOOD_COLLISION_RADIUS: 22,
-    OBSTACLE_COLLISION_RADIUS: 16,
+    OBSTACLE_COLLISION_RADIUS: 10,   // Tam temas (was 16)
     SELF_COLLISION_RADIUS: 6,
-    AI_COLLISION_RADIUS: 14,
+    AI_COLLISION_RADIUS: 10,         // Tam temas – head/body (was 14)
+    CONTACT_RADIUS: 10,              // Ölüm için tam temas mesafesi (head vs body, tail)
 
     FRAME_RATE: 60,
 };
@@ -125,7 +126,7 @@ export const getInfiniteLevel = (level) => ({
     title: `⭐ EFSANE ${level - 9} ⭐`,
 });
 
-// ============== FOOD TYPES ==============
+// ============== FOOD TYPES (16 – av çeşidi 2x) ==============
 export const FOOD_TYPES = [
     { id: 'mouse', emoji: '🐁', name: 'Fare', points: 8, size: 22 },
     { id: 'frog', emoji: '🐸', name: 'Kurbağa', points: 12, size: 24 },
@@ -135,6 +136,14 @@ export const FOOD_TYPES = [
     { id: 'egg', emoji: '🥚', name: 'Yumurta', points: 6, size: 18 },
     { id: 'bug', emoji: '🪲', name: 'Böcek', points: 4, size: 16 },
     { id: 'cricket', emoji: '🦗', name: 'Cırcır', points: 10, size: 20 },
+    { id: 'skunk', emoji: '🦨', name: 'Kokarca', points: 12, size: 22 },
+    { id: 'lamb', emoji: '🐑', name: 'Kuzu', points: 12, size: 22 },
+    { id: 'chicken', emoji: '🐔', name: 'Tavuk', points: 10, size: 22 },
+    { id: 'squirrel', emoji: '🐿️', name: 'Sincap', points: 10, size: 20 },
+    { id: 'eagle', emoji: '🦅', name: 'Kartal', points: 22, size: 26 },
+    { id: 'monkey', emoji: '🐒', name: 'Maymun', points: 18, size: 24 },
+    { id: 'hamster', emoji: '🐹', name: 'Hamster', points: 10, size: 20 },
+    { id: 'turtle', emoji: '🐢', name: 'Kaplumbağa', points: 8, size: 20 },
 ];
 
 // CANDY (dropped when AI dies) - slither.io style - BALANCED
@@ -156,8 +165,8 @@ export const OBSTACLE_TYPES = [
 
 // ============== DIFFICULTY ==============
 export const DIFFICULTY = {
-    INITIAL_FOOD_COUNT: 44,   // Bumped for larger world (was 30)
-    MAX_FOOD: 72,             // Bumped for larger world (was 50)
+    INITIAL_FOOD_COUNT: 352,  // Total av 2x (was 176)
+    MAX_FOOD: 576,            // Total av 2x (was 288)
     MAX_OBSTACLES: 25,
 };
 
