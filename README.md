@@ -1,27 +1,35 @@
+<p align="center">
+  <img src="./docs/github-cover.svg" alt="SnakePlanet cover" width="100%" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-React_Native-20232A?style=for-the-badge&logo=react" alt="React Native" />
+  <img src="https://img.shields.io/badge/Runtime-Expo-000020?style=for-the-badge&logo=expo" alt="Expo" />
+  <img src="https://img.shields.io/badge/Genre-Arcade_Game-14532d?style=for-the-badge" alt="Arcade Game" />
+</p>
+
 # SnakePlanet
 
-SnakePlanet is a modern mobile take on the classic snake formula.
-It focuses on a cleaner feel, stronger feedback, and a more polished arcade experience on mobile.
+`SnakePlanet` reimagines the classic snake formula as a sharper mobile arcade product with better feedback, cleaner presentation, and replay-focused pacing.
 
-## What It Does
+## What Makes It Stronger Than a Basic Clone
 
-- Reimagines the classic snake loop for mobile play
-- Uses simple mechanics with modern presentation
-- Focuses on replayability and responsive game feel
-- Targets a lightweight casual game experience
+- Pushes the project beyond a simple tutorial-style snake game
+- Focuses on feel, responsiveness, and repeatable sessions
+- Works as a compact casual game with stronger identity
+- Presents arcade mechanics with a more polished mobile layer
 
-## Tech Stack
+## Stack
 
 - React Native
 - Expo
 - JavaScript
 
-## Project Goal
+## Product Direction
 
-This project takes a familiar arcade concept and gives it a smoother product feel.
-The goal is to create a compact game that feels playful, responsive, and visually deliberate.
+The project aims to keep the classic loop familiar while making the overall experience feel more deliberate, modern, and replay-friendly on mobile.
 
-## Getting Started
+## Run Locally
 
 ```bash
 npm install
